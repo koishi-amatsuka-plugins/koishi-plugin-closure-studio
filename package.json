@@ -1,7 +1,8 @@
 {
   "name": "koishi-plugin-closure-studio",
   "description": "closure web api.",
-  "version": "0.0.1",
+  "author": "Amatsuka <amatsukamao@qq.com>",
+  "version": "0.0.2",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -20,5 +21,12 @@
   },
   "dependencies": {
     "eventsource-parser": "^3.0.6"
+  },
+  "koishi": {
+    "service": {
+      "required": [
+        "database"
+      ]
+    }
   }
 }

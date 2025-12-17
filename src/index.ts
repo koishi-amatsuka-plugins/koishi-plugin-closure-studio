@@ -5,6 +5,8 @@ import fs from "node:fs";
 
 export const name = "closure-studio";
 
+export const inject = ["database"];
+
 export interface Config {
   email: string;
   password: string;

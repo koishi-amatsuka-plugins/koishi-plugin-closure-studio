@@ -84,6 +84,18 @@ export async function apply(
     });
   };
 
+  const sleep = (ms: number, signal?: AbortSignal) => {
+    return new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) return reject(new Error("aborted"));
+      const timer = setTimeout(resolve, ms);
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(new Error("aborted"));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  };
+
   let token = fs.readFileSync(tokenPath, "utf-8");
   if (token) {
     getMe(token).catch(() => {
@@ -101,22 +113,61 @@ export async function apply(
   const gameUrl = new URL("https://api-tunnel.arknights.app/sse/games");
   gameUrl.searchParams.set("token", token);
 
-  // SSE Stream
-  const controller = new AbortController();
-  const gameEventStream = await http
-    .get(gameUrl.href, {
-      headers: {
-        Accept: "text/event-stream",
-        "Cache-Control": "no-cache",
-      },
-      responseType: "stream",
-      signal: controller.signal,
-    })
-    .catch((err) => {
-      throw new Error("Game event stream failed", { cause: err });
+  // SSE Stream (auto reconnect)
+  const lifecycle = new AbortController();
+  let streamController: AbortController | null = null;
+  let reconnectAttempts = 0;
+
+  const isAuthError = (err: unknown) => {
+    const anyErr = err as any;
+    const status = anyErr?.response?.status ?? anyErr?.status;
+    return status === 401 || status === 403;
+  };
+
+  const refreshToken = async () => {
+    const next = await getToken({ email, password });
+    token = next;
+    fs.writeFileSync(tokenPath, token);
+    gameUrl.searchParams.set("token", token);
+    logger.info("Token updated", token);
+  };
+
+  const connectOnce = async () => {
+    streamController = new AbortController();
+    const onLifecycleAbort = () => streamController?.abort();
+    lifecycle.signal.addEventListener("abort", onLifecycleAbort, {
+      once: true,
     });
+    try {
+      const gameEventStream = await http.get(gameUrl.href, {
+        headers: {
+          Accept: "text/event-stream",
+          "Cache-Control": "no-cache",
+        },
+        responseType: "stream",
+        signal: streamController.signal,
+      });
+
+      reconnectAttempts = 0;
+      logger.info("Game event stream connected");
+
+      const decoder = new TextDecoder();
+      for await (const chunk of gameEventStream) {
+        if (lifecycle.signal.aborted) break;
+        parser.feed(decoder.decode(chunk, { stream: true }));
+      }
+      const tail = decoder.decode();
+      if (tail) parser.feed(tail);
+      throw new Error("stream ended");
+    } finally {
+      lifecycle.signal.removeEventListener("abort", onLifecycleAbort);
+      streamController = null;
+    }
+  };
+
   ctx.on("dispose", () => {
-    controller.abort();
+    lifecycle.abort();
+    streamController?.abort();
   });
 
   const parser = createParser({
@@ -135,10 +186,37 @@ export async function apply(
     },
   });
 
-  const decoder = new TextDecoder();
-  for await (const chunk of gameEventStream) {
-    parser.feed(decoder.decode(chunk, { stream: true }));
+  while (!lifecycle.signal.aborted) {
+    try {
+      await connectOnce();
+    } catch (err) {
+      if (lifecycle.signal.aborted) break;
+
+      if (isAuthError(err)) {
+        logger.warn("Game event stream auth failed, refreshing token...");
+        try {
+          await refreshToken();
+        } catch (refreshErr) {
+          logger.error(refreshErr);
+        }
+      } else {
+        logger.warn(err);
+      }
+
+      reconnectAttempts++;
+      const base = Math.min(
+        30_000,
+        1_000 * 2 ** Math.min(reconnectAttempts, 5),
+      );
+      const jitter = Math.floor(Math.random() * 500);
+      const delay = base + jitter;
+      logger.info(`Reconnect in ${delay}ms (attempt ${reconnectAttempts})`);
+
+      try {
+        await sleep(delay, lifecycle.signal);
+      } catch {
+        break;
+      }
+    }
   }
-  const tail = decoder.decode();
-  if (tail) parser.feed(tail);
 }
